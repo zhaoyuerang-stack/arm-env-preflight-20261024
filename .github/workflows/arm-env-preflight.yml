@@ -1,0 +1,203 @@
+name: ARM CPU10 environment preflight
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/arm-env-preflight.yml]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: arm-environment-preflight
+  cancel-in-progress: false
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - name: Read allowlisted environment metadata
+        shell: bash
+        run: |
+          timeout --signal=TERM --kill-after=5s 120s python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Read-only, allowlisted metadata probe. No BPF objects, CPU experiments or network calls."""
+          import datetime, gzip, hashlib, json, os, pathlib, platform, shutil, struct, subprocess
+          
+          MAX_READ = 64 * 1024 * 1024
+          P = pathlib.Path
+          def read(path, limit=1048576):
+              try:
+                  with open(path, "rb") as f:
+                      b = f.read(limit + 1)
+                  if len(b) > limit:
+                      return {"status": "LIMIT_EXCEEDED"}
+                  return {"status": "READABLE", "text": b.decode("utf-8", "replace").strip()}
+              except (OSError, ValueError) as e:
+                  return {"status": "UNAVAILABLE", "error_type": type(e).__name__}
+          
+          def file_info(path, btf=False):
+              r = {"exists": P(path).exists(), "readable": os.access(path, os.R_OK)}
+              if not r["readable"]:
+                  return r
+              try:
+                  size = os.stat(path).st_size
+                  r["size_bytes"] = size
+                  if size > MAX_READ:
+                      r["hash_status"] = "LIMIT_EXCEEDED"
+                      return r
+                  h = hashlib.sha256()
+                  total = 0
+                  first = b""
+                  with open(path, "rb") as f:
+                      while True:
+                          b = f.read(min(1048576, MAX_READ + 1 - total))
+                          if not b:
+                              break
+                          if not first:
+                              first = b[:24]
+                          total += len(b)
+                          if total > MAX_READ:
+                              r["hash_status"] = "LIMIT_EXCEEDED"
+                              return r
+                          h.update(b)
+                  r.update(sha256=h.hexdigest(), bytes_read=total, hash_status="COMPLETE")
+                  if btf:
+                      r["btf_magic_matches"] = first[:2] in (b"\x9f\xeb", b"\xeb\x9f")
+                      r["btf_version"] = first[2] if len(first) >= 3 else None
+              except OSError as e:
+                  r["error_type"] = type(e).__name__
+              return r
+          
+          CAP_CODE = r"""
+          import json, os
+          keys={"CapInh","CapPrm","CapEff","CapBnd","CapAmb","NoNewPrivs","Seccomp"}
+          v={}
+          with open("/proc/self/status") as f:
+              for line in f:
+                  k,_,val=line.partition(":")
+                  if k in keys: v[k]=val.strip()
+          r={"euid":os.geteuid(),"status_fields":v,
+             "namespaces":{n:os.readlink("/proc/self/ns/"+n) for n in ("user","pid","mnt")}}
+          r["capabilities"]={k:{n:bool(int(v.get(k,"0"),16)&(1<<bit))
+              for n,bit in (("CAP_BPF",39),("CAP_PERFMON",38),("CAP_SYS_ADMIN",21))}
+              for k in ("CapEff","CapPrm","CapBnd")}
+          print(json.dumps(r,sort_keys=True))
+          """
+          def caps(root=False):
+              args = (["sudo","-n"] if root else []) + ["python3","-c",CAP_CODE]
+              try:
+                  x = subprocess.run(args, capture_output=True, text=True, timeout=10)
+                  return json.loads(x.stdout) if x.returncode == 0 else {"status":"UNAVAILABLE","exit_code":x.returncode}
+              except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+                  return {"status":"UNAVAILABLE","error_type":type(e).__name__}
+          
+          release = platform.release()
+          out = {"schema":"cpu10-arm-env-preflight-v1","scope":"ENVIRONMENT_METADATA_ONLY",
+                 "utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                 "kernel":{"machine":platform.machine(),"release":release,"version":platform.version()},
+                 "boot_id":read("/proc/sys/kernel/random/boot_id"),
+                 "normal_context":caps(), "sudo_context":caps(True),
+                 "btf_vmlinux":file_info("/sys/kernel/btf/vmlinux", True),
+                 "kernel_notes":file_info("/sys/kernel/notes"),
+                 "lockdown":read("/sys/kernel/security/lockdown"),
+                 "sysctls":{k:read("/proc/sys/"+k) for k in
+                     ("kernel/unprivileged_bpf_disabled","kernel/perf_event_paranoid","kernel/kptr_restrict")},
+                 "tools":{k:bool(shutil.which(k)) for k in ("sudo","python3","clang","cc","bpftool","docker","readelf")},
+                 "capacity":{"cpu_count":os.cpu_count(),"affinity_cpu_count":len(os.sched_getaffinity(0)),
+                             "disk_root_bytes":dict(zip(("total","used","free"),shutil.disk_usage("/")))},
+                 "source_correspondence":"NOT_ESTABLISHED",
+                 "program_load_attach":"NOT_RUN","native_causal_observer":"NOT_RUN",
+                 "cpu10_positive_negative":"NOT_RUN","E036":"NOT_RUN","cpu_cause":"NOT_EVALUATED"}
+          try:
+              with open("/sys/kernel/notes", "rb") as f:
+                  data = f.read(1048577)
+              if len(data) <= 1048576:
+                  pos=0
+                  endian="<" if os.sys.byteorder=="little" else ">"
+                  while pos+12<=len(data):
+                      a,b,t=struct.unpack_from(endian+"III",data,pos)
+                      pos+=12
+                      name=data[pos:pos+a].rstrip(b"\0")
+                      pos+=(a+3)&~3
+                      desc=data[pos:pos+b]
+                      pos+=(b+3)&~3
+                      if name==b"GNU" and t==3:
+                          out["kernel_notes"]["gnu_build_id"]=desc.hex()
+                          break
+          except (OSError,ValueError,struct.error):
+              pass
+          
+          mem=read("/proc/meminfo")
+          out["capacity"]["memory_kib"]={}
+          if mem["status"]=="READABLE":
+              for line in mem["text"].splitlines():
+                  k,_,v=line.partition(":")
+                  if k in ("MemTotal","MemAvailable"):
+                      out["capacity"]["memory_kib"][k]=int(v.strip().split()[0])
+          
+          cfg_keys=set(("BPF BPF_SYSCALL BPF_JIT BPF_EVENTS DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES "
+                        "KPROBES KPROBE_EVENTS FTRACE FUNCTION_TRACER PERF_EVENTS KALLSYMS KALLSYMS_ALL "
+                        "TRACEPOINTS HAVE_SYSCALL_TRACEPOINTS STACKTRACE FRAME_POINTER POSIX_TIMERS "
+                        "CGROUPS SECCOMP SECCOMP_FILTER SECURITY_LANDLOCK SECURITY_LOCKDOWN_LSM "
+                        "LOCK_DOWN_KERNEL_FORCE_INTEGRITY IKHEADERS").split())
+          out["config"]={"status":"UNAVAILABLE","values":{}}
+          for path in ("/boot/config-"+release,"/lib/modules/"+release+"/config","/proc/config.gz"):
+              try:
+                  op=gzip.open if path.endswith(".gz") else open
+                  with op(path,"rt",encoding="utf-8",errors="replace") as f:
+                      text=f.read(2097153)
+                  if len(text)>2097152:
+                      continue
+                  vals={}
+                  for line in text.splitlines():
+                      if line.startswith("CONFIG_") and "=" in line:
+                          k,v=line.split("=",1)
+                          if k[7:] in cfg_keys: vals[k]=v
+                      elif line.startswith("# CONFIG_") and line.endswith(" is not set"):
+                          k=line[2:-11]
+                          if k[7:] in cfg_keys: vals[k]="n"
+                  out["config"]={"status":"READABLE","path":path,"values":vals}
+                  break
+              except (OSError,ValueError):
+                  continue
+          base=P("/lib/modules")/release
+          out["module_tree"]={k:{"exists":(base/k).exists(),"is_symlink":(base/k).is_symlink()}
+                              for k in ("build","source","modules.builtin")}
+          out["tracepoint_metadata"]={k:file_info("/sys/kernel/tracing/events/"+k+"/id")
+             for k in ("sched/sched_process_fork","sched/sched_process_exit","signal/signal_generate")}
+          
+          symbols=("check_process_timers","posix_cpu_timers","run_posix_cpu_timers","send_signal_locked",
+                   "__send_signal_locked","do_send_sig_info","group_send_sig_info","complete_signal",
+                   "tracepoint_probe_register","tracepoint_probe_unregister","tracepoint_synchronize_unregister")
+          seen=set()
+          try:
+              with open("/proc/kallsyms") as f:
+                  for n,line in enumerate(f):
+                      if n>=1000000: break
+                      fields=line.split()
+                      if len(fields)>=3 and fields[2] in symbols: seen.add(fields[2])
+              out["symbols"]={"status":"READABLE_NAMES_ONLY","present":sorted(seen),
+                              "not_seen":[s for s in symbols if s not in seen]}
+          except OSError:
+              out["symbols"]={"status":"UNAVAILABLE"}
+          
+          cg=read("/proc/self/cgroup")
+          out["cgroup"]={"version":2 if P("/sys/fs/cgroup/cgroup.controllers").exists() else 1,"levels":[]}
+          if cg["status"]=="READABLE" and out["cgroup"]["version"]==2:
+              line=next((s for s in cg["text"].splitlines() if s.startswith("0::")),None)
+              if line:
+                  root=P("/sys/fs/cgroup").resolve()
+                  current=(root/line[3:].lstrip("/")).resolve()
+                  for level in range(8):
+                      if current!=root and root not in current.parents: break
+                      values={k:read(current/k,65536) for k in
+                          ("cgroup.controllers","cpu.max","memory.max","memory.current","memory.events","pids.max","pids.current")}
+                      out["cgroup"]["levels"].append({"depth_from_self":level,"values":values})
+                      if current==root: break
+                      current=current.parent
+          out["interpretation"]={"arm64_metadata_match":platform.machine() in ("aarch64","arm64"),
+              "bpf_or_perf_permission_verified_by_operation":False,
+              "metadata_does_not_prove_cpu_hard_causality":True}
+          print("PREFLIGHT_JSON_BEGIN")
+          print(json.dumps(out,sort_keys=True,indent=2))
+          print("PREFLIGHT_JSON_END")
+          
+          PY
